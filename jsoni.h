@@ -42,17 +42,12 @@ struct JsonValue
     } as;
 };
 
-#ifndef JSONI_DEFAULT_DOC_CAPACITY
-    /* Default capacity for initial allocation of document. */
-    #define JSONI_DEFAULT_DOC_CAPACITY 64
+#ifndef JSONI_CHUNK_SIZE
+    #define JSONI_CHUNK_SIZE 2048
 #endif
 
 /* A JSON document. */
-typedef struct JsonDoc
-{
-    JsonValue *data;
-    size_t len, cap;
-} JsonDoc;
+typedef struct JsonDoc JsonDoc;
 
 /* JSON error codes. */
 typedef enum
@@ -80,7 +75,7 @@ JsonDoc *json_parse(const char *src, size_t len, JsonError *err);
 void json_free(JsonDoc *doc);
 
 /* The root JSON value of the JSON document. */
-#define json_root(doc) ((JsonValue *)((doc)->data))
+const JsonValue *json_root(const JsonDoc *doc);
 
 /* Convert the JSON value into int64. Returns false on failure. */
 bool json_as_int64(const JsonValue *v, int64_t *out);
@@ -99,43 +94,84 @@ bool json_as_int64(const JsonValue *v, int64_t *out);
 #include <ctype.h>
 #include <string.h>
 
-/* Allocate a JSON document with JSONI_DEFAULT_DOC_CAPACITY. */
-static JsonDoc *json__doc_create(void)
+/* A chunk of memory */
+typedef struct JsonChunk
 {
-    JsonDoc *doc = calloc(1, sizeof(*doc));
-    assert(doc);
-    doc->data = calloc(JSONI_DEFAULT_DOC_CAPACITY, sizeof(JsonValue));
-    assert(doc->data);
-    return doc;
+    struct JsonChunk *next;
+    size_t cap, used;
+    /* payload, aligned by 8 */
+} JsonChunk;
+
+#define JSONI_CHUNK_ALIGN 8
+
+struct JsonDoc
+{
+    JsonChunk *head; /* JsonDoc is allocated within head */
+    const JsonValue *root;
+};
+
+/* Allocate n in the JSON document's arena. */
+static void *json__alloc(JsonDoc *doc, size_t n)
+{
+    n = (n + (JSONI_CHUNK_ALIGN-1)) & ~(size_t)(JSONI_CHUNK_ALIGN-1);
+    JsonChunk *c = doc->head;
+
+    // Oversized chunk handling
+    if (c && n > c->cap / 2)
+    {
+        JsonChunk *nc = calloc(1, sizeof(*nc) + n);
+        if (!nc) return NULL;
+
+        nc->cap = (nc->used = n);
+        nc->next = c->next;
+        c->next = nc;
+        return (char *)(nc + 1);
+    }
+
+    if (!c || (c->cap - c->used) < n)
+    {
+        size_t cap = c ? c->cap * 2 : JSONI_CHUNK_SIZE;
+        if (cap < n) cap = n;
+
+        JsonChunk *nc = calloc(1, sizeof(*nc) + cap);
+        if (!nc) return NULL;
+
+        nc->next = c;
+        nc->cap  = cap;
+        nc->used = 0;
+
+        doc->head = (c = nc);
+    }
+
+    void *p = (char *)(c+1) + c->used;
+    c->used += n;
+    return p;
 }
 
-/* Grow a JSON document to satisfy the larger of `min_cap` and `doc->len+1`. */
-static void json__doc_grow(JsonDoc *doc, size_t min_cap)
+void json_free(JsonDoc *doc)
 {
-    assert(doc);
-
-    if (doc->len + 1 > min_cap)
-        min_cap = doc->len + 1;
-
-    if (min_cap > doc->cap)
+    for (JsonChunk *c = doc->head; c;)
     {
-        size_t new_cap = doc->cap == 0
-            ? JSONI_DEFAULT_DOC_CAPACITY : doc->cap * 2;
-        while (min_cap > new_cap) new_cap *= 2;
-        JsonValue *new_data = realloc(doc->data, new_cap);
-        assert(new_data);
-        doc->cap = new_cap;
-        doc->data = new_data;
+        JsonChunk *next = c->next;
+        free(c);
+        c = next;
     }
 }
 
-/* Copy a JSON value to the document and return a pointer to it. */
-static const JsonValue *json__doc_copy(JsonDoc *doc, const JsonValue *v)
+/* Allocate a JSON document. */
+static JsonDoc *json__doc_create(void)
 {
-    assert(doc && v);
-    json__doc_grow(doc, 0);
-    doc->data[doc->len++] = *v;
-    return &doc->data[doc->len-1];
+    JsonChunk *c = calloc(1, sizeof(*c) + JSONI_CHUNK_SIZE);
+    assert(c);
+    c->next = NULL;
+    c->cap = JSONI_CHUNK_SIZE;
+
+    JsonDoc *doc = (JsonDoc *)(c + 1);
+    doc->head = c;
+    doc->root = NULL;
+
+    c->used = sizeof(*doc);
+    return doc;
 }
 
 /* Private JSON parser type. */
@@ -224,44 +260,45 @@ static const JsonValue *json__parse_number(JsonParser *p, JsonError *err)
 {
     (void)err;
 
-    JsonValue val = {
-        .kind = JSON_NUMBER,
-        .as.num.is_int = true,
-        .as.num.i = 0,
-    };
+    JsonValue *v = json__alloc(p->doc, sizeof(*v));
+    v->kind = JSON_NUMBER;
+    v->as.num.is_int = true;
+    v->as.num.i = 0;
 
     while (!json__parser_is_eof(p) && isdigit(json__parser_chr(p)))
     {
-        val.as.num.i *= 10;
-        val.as.num.i += json__parser_chr(p) - '0';
+        v->as.num.i *= 10;
+        v->as.num.i += json__parser_chr(p) - '0';
         p->pos++;
     }
 
-    return json__doc_copy(p->doc, &val);
+    return v;
 }
 
 /* Parse a literal name (null, true, or false). */
 static const JsonValue *json__parse_literal(JsonParser *p, JsonError *err)
 {
+    JsonValue *v = json__alloc(p->doc, sizeof(*v));
+
     if (json__parser_match_str(p, "null",  4))
     {
-        JsonValue val = {.kind=JSON_NULL};
-        return json__doc_copy(p->doc, &val);
+        v->kind = JSON_NULL;
     }
-
-    if (json__parser_match_str(p, "true",  4))
+    else if (json__parser_match_str(p, "true",  4))
     {
-        JsonValue val = {.kind=JSON_BOOL, .as.boolean=true};
-        return json__doc_copy(p->doc, &val);
+        v->kind = JSON_BOOL;
+        v->as.boolean = true;
     }
-
-    if (json__parser_match_str(p, "false", 5))
+    else if (json__parser_match_str(p, "false", 5))
     {
-        JsonValue val = {.kind=JSON_BOOL, .as.boolean=false};
-        return json__doc_copy(p->doc, &val);
+        v->kind = JSON_BOOL;
+        v->as.boolean = false;
     }
-
-    return json__error(p, err, JSON_ERR_INVALID_LITERAL);
+    else
+    {
+        return json__error(p, err, JSON_ERR_INVALID_LITERAL);
+    }
+    return v;
 }
 
 /* Parse a JSON value, return NULL if error. */
@@ -293,7 +330,8 @@ JsonDoc *json_parse(const char *src, size_t len, JsonError *err)
         .pos = 0,   .doc = doc,
     };
 
-    if (!json__parse(&parser, err))
+    doc->root = json__parse(&parser, err);
+    if (!doc->root)
     {
         json_free(doc);
         return NULL;
@@ -302,10 +340,9 @@ JsonDoc *json_parse(const char *src, size_t len, JsonError *err)
     return doc;
 }
 
-void json_free(JsonDoc *doc)
+const JsonValue *json_root(const JsonDoc *doc)
 {
-    free(doc->data);
-    free(doc);
+    return doc->root;
 }
 
 bool json_as_int64(const JsonValue *v, int64_t *out)
