@@ -27,6 +27,7 @@
 #define PARSE_END() \
     if (doc) json_free(doc);
 
+#define approx(da, db) (fabs(da - db) < 1e-6)
 
 TEST(test_json_empty_source)
 {
@@ -53,19 +54,77 @@ TEST(test_json_parse_special_literals)
     PARSE_END();
 }
 
-TEST(test_json_parse_number)
+TEST(test_json_parse_integer)
 {
     PARSE_START();
-        PARSE("1");
-        CUT_MUST(root->kind == JSON_NUMBER);
-
         int64_t val;
+
+        PARSE("1");
         CUT_MUST(json_as_int64(root, &val));
         CUT_CHECK(val == 1);
 
         PARSE("1234");
         CUT_MUST(json_as_int64(root, &val));
         CUT_CHECK(val == 1234);
+
+        PARSE("-9223372036854775807");
+        CUT_MUST(json_as_int64(root, &val));
+        CUT_CHECK(val == -9223372036854775807LL);
+
+        PARSE("9223372036854775808");
+        CUT_CHECK(!json_as_int64(root, &val));
+
+        double dv;
+        CUT_MUST(json_as_double(root, &dv));
+        CUT_CHECK(approx(dv, 9223372036854775808.0));
+
+        PARSE_FAIL("01", JSON_ERR_LEADING_ZERO);
+
+        PARSE_FAIL("+1", JSON_ERR_LEADING_PLUS);
+    PARSE_END();
+}
+
+TEST(test_parse_decimal)
+{
+    PARSE_START();
+        double val;
+
+        PARSE("1.23");
+        CUT_MUST(json_as_double(root, &val));
+        CUT_CHECK(approx(val, 1.23));
+
+        PARSE("-1.0");
+        CUT_MUST(json_as_double(root, &val));
+        CUT_CHECK(approx(val, -1.0));
+
+        PARSE("9223372036800000000.0");
+        CUT_MUST(json_as_double(root, &val));
+        CUT_CHECK(approx(val, 9223372036800000000.0));
+
+        int64_t iv;
+        CUT_MUST(json_as_int64(root, &iv));
+        CUT_CHECK(iv == 9223372036800000000LL);
+
+        PARSE_FAIL(".123", JSON_ERR_LEADING_POINT);
+        PARSE_FAIL("123.", JSON_ERR_MISSING_FRACTION_DIGIT);
+    PARSE_END();
+}
+
+TEST(test_parse_exponent)
+{
+    PARSE_START();
+        double val;
+
+        PARSE("1e9");
+        CUT_MUST(json_as_double(root, &val));
+        CUT_CHECK(approx(val, 1e9));
+
+        PARSE("-123e-45");
+        CUT_MUST(json_as_double(root, &val));
+        CUT_CHECK(approx(val, -123e-45));
+
+        PARSE_FAIL("123e", JSON_ERR_MISSING_EXPONENT_DIGIT);
+        PARSE_FAIL("1e999", JSON_ERR_NUMERIC_RANGE);
     PARSE_END();
 }
 

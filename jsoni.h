@@ -55,7 +55,31 @@ typedef enum
     JSON_ERR_UNEXPECTED_EOF,
     JSON_ERR_ILLEGAL_CHARACTER,
     JSON_ERR_INVALID_LITERAL,
+
+    JSON_ERR_MISSING_DIGIT,
+    JSON_ERR_MISSING_FRACTION_DIGIT,
+    JSON_ERR_MISSING_EXPONENT_DIGIT,
+    JSON_ERR_NUMERIC_RANGE,
+
+    JSON_ERR_LEADING_ZERO,
+    JSON_ERR_LEADING_PLUS,
+    JSON_ERR_LEADING_POINT,
 } JsonErrorCode;
+
+const char *json_error_messages[] = {
+    [JSON_ERR_UNEXPECTED_EOF]         = "Unexpected end of file",
+    [JSON_ERR_ILLEGAL_CHARACTER]      = "Illegal character",
+    [JSON_ERR_INVALID_LITERAL]        = "Invalid literal",
+
+    [JSON_ERR_MISSING_DIGIT]          = "Missing digit in number",
+    [JSON_ERR_MISSING_FRACTION_DIGIT] = "Missing digit after decimal point",
+    [JSON_ERR_MISSING_EXPONENT_DIGIT] = "Missing digit after exponent",
+    [JSON_ERR_NUMERIC_RANGE]          = "Overflow or underflow in number",
+
+    [JSON_ERR_LEADING_ZERO]           = "Leading zeros are not allowed",
+    [JSON_ERR_LEADING_PLUS]           = "Leading plus sign is not allowed",
+    [JSON_ERR_LEADING_POINT]          = "Leading decimal point is not allowed",
+};
 
 /* Error information. */
 typedef struct JsonError
@@ -80,6 +104,12 @@ const JsonValue *json_root(const JsonDoc *doc);
 /* Convert the JSON value into int64. Returns false on failure. */
 bool json_as_int64(const JsonValue *v, int64_t *out);
 
+/* Convert the JSON value into double. Returns false on failure. */
+bool json_as_double(const JsonValue *v, double *out);
+
+/* Convert the JSON value into boolean. Returns false on failure. */
+bool json_as_bool(const JsonValue *v, bool *out);
+
 #endif // JSONI_H_
 
 
@@ -93,6 +123,8 @@ bool json_as_int64(const JsonValue *v, int64_t *out);
 #include <assert.h>
 #include <ctype.h>
 #include <string.h>
+#include <errno.h>
+#include <math.h>
 
 /* A chunk of memory */
 typedef struct JsonChunk
@@ -183,20 +215,22 @@ typedef struct
 } JsonParser;
 
 /* Whether the parser is at EOF. */
-#define json__parser_is_eof(p) ((p)->pos >= (p)->len)
+#define json__is_eof(p) ((p)->pos >= (p)->len)
 
 /* The current char the parser is at or '\0' if EOF. */
-#define json__parser_chr(p) (json__parser_is_eof(p) ? '\0' : (p)->src[(p)->pos])
+#define json__chr(p) (json__is_eof(p) ? '\0' : (p)->src[(p)->pos])
 
 /* The current pointer into src or NULL if EOF. */
-#define json__parser_str(p) (json__parser_is_eof(p) ? "" : (p)->src + (p)->pos)
+#define json__str(p) (json__is_eof(p) ? "" : (p)->src + (p)->pos)
 
 /* The pointer to the last character of src. */
-#define json__parser_str_end(p) ((p)->src + (p)->len - 1)
+#define json__str_end(p) ((p)->src + (p)->len - 1)
+
+#define json__is_digit(p) (!json__is_eof(p) && isdigit(json__chr(p)))
 
 /* Advance parser until the next non-whitespace character or EOF. */
-#define json__parser_skip_ws(p) do {                                \
-    while (!json__parser_is_eof(p) && isspace(json__parser_chr(p))) \
+#define json__skip_ws(p) do {                                \
+    while (!json__is_eof(p) && isspace(json__chr(p))) \
         (p)->pos++;                                                 \
 } while (0)
 
@@ -207,7 +241,7 @@ static inline bool json__is_token_boundary(char c)
     if (isspace(c)) return true;
 
     return c == '{' || c == '}' || c == '[' || c == ']'
-        || c == ':' || c == ',' || c == '.';
+        || c == ':' || c == ',' || c == '.' || c == '"';
 }
 
 /* Return whether the next literal is `str`. */
@@ -215,23 +249,17 @@ static inline bool json__parser_match_str(JsonParser *p, const char *str, size_t
 {
     if (n > p->len - p->pos) return false;
 
-    const char *ptr = json__parser_str(p);
+    const char *ptr = json__str(p);
     if (!ptr) return false;
 
     for (size_t i = 0; i < n; i++)
         if (str[i] != *ptr++) return false;
 
-    if (ptr <= json__parser_str_end(p))
+    if (ptr <= json__str_end(p))
         return json__is_token_boundary(*ptr);
 
     return true;
 }
-
-static const char *json_error_messages[] = {
-    [JSON_ERR_UNEXPECTED_EOF]    = "Unexpected end of file",
-    [JSON_ERR_ILLEGAL_CHARACTER] = "Illegal character",
-    [JSON_ERR_INVALID_LITERAL]   = "Invalid literal",
-};
 
 /* Fill the error with location and code, and return NULL for convenience. */
 static const JsonValue *json__error(JsonParser *p, JsonError *err, JsonErrorCode code)
@@ -258,18 +286,62 @@ static const JsonValue *json__parse(JsonParser *p, JsonError *err);
 /* Parse a JSON number value. */
 static const JsonValue *json__parse_number(JsonParser *p, JsonError *err)
 {
-    (void)err;
-
     JsonValue *v = json__alloc(p->doc, sizeof(*v));
     v->kind = JSON_NUMBER;
     v->as.num.is_int = true;
-    v->as.num.i = 0;
 
-    while (!json__parser_is_eof(p) && isdigit(json__parser_chr(p)))
+    size_t start = p->pos;
+
+    if (json__chr(p) == '-') p->pos++;
+
+    if (json__chr(p) == '0')
+        return json__error(p, err, JSON_ERR_LEADING_ZERO);
+    if (!json__is_digit(p))
+        return json__error(p, err, JSON_ERR_MISSING_DIGIT);
+    while (json__is_digit(p)) p->pos++;
+
+    if (json__chr(p) == '.')
     {
-        v->as.num.i *= 10;
-        v->as.num.i += json__parser_chr(p) - '0';
+        v->as.num.is_int = false;
         p->pos++;
+
+        if (!json__is_digit(p))
+            return json__error(p, err, JSON_ERR_MISSING_FRACTION_DIGIT);
+        while (json__is_digit(p)) p->pos++;
+    }
+
+    if (json__chr(p) == 'e')
+    {
+        v->as.num.is_int = false;
+        p->pos++;
+
+        if (json__chr(p) == '-' || json__chr(p) == '+')
+            p->pos++;
+
+        if (!json__is_digit(p))
+            return json__error(p, err, JSON_ERR_MISSING_EXPONENT_DIGIT);
+        while (json__is_digit(p)) p->pos++;
+    }
+
+    size_t len = p->pos - start;
+    char buffer[len+1];
+    memcpy(buffer, p->src + start, len);
+    buffer[len] = '\0';
+
+    if (v->as.num.is_int)
+    {
+        errno = 0;
+        v->as.num.i = strtoll(buffer, NULL, 10);
+    }
+
+    if (!v->as.num.is_int || errno == ERANGE)
+    {
+        v->as.num.is_int = false;
+
+        errno = 0;
+        v->as.num.d = strtod(buffer, NULL);
+        if (errno == ERANGE || !isfinite(v->as.num.d))
+            return json__error(p, err, JSON_ERR_NUMERIC_RANGE);
     }
 
     return v;
@@ -307,12 +379,20 @@ static const JsonValue *json__parse(JsonParser *p, JsonError *err)
     if (p->len == 0)
         return json__error(p, err, JSON_ERR_UNEXPECTED_EOF);
 
-    json__parser_skip_ws(p);
+    json__skip_ws(p);
 
-    if (isdigit(json__parser_chr(p)))
+    if (json__is_eof(p))
+        return json__error(p, err, JSON_ERR_UNEXPECTED_EOF);
+
+    if (json__chr(p) == '+')
+        return json__error(p, err, JSON_ERR_LEADING_PLUS);
+    if (json__chr(p) == '.')
+        return json__error(p, err, JSON_ERR_LEADING_POINT);
+
+    if (json__is_digit(p) || json__chr(p) == '-')
         return json__parse_number(p, err);
 
-    if (isalpha(json__parser_chr(p)))
+    if (isalpha(json__chr(p)))
         return json__parse_literal(p, err);
 
     return json__error(p, err, JSON_ERR_ILLEGAL_CHARACTER);
@@ -347,10 +427,40 @@ const JsonValue *json_root(const JsonDoc *doc)
 
 bool json_as_int64(const JsonValue *v, int64_t *out)
 {
-    if (v->kind != JSON_NUMBER || !v->as.num.is_int)
+    if (v->kind != JSON_NUMBER)
         return false;
 
-    *out = v->as.num.i;
+    if (!v->as.num.is_int)
+    {
+        if (v->as.num.d > (long double)INT64_MAX)
+            return false;
+        *out = (int64_t)v->as.num.d;
+    }
+    else
+    {
+        *out = v->as.num.i;
+    }
+    return true;
+}
+
+bool json_as_double(const JsonValue *v, double *out)
+{
+    if (v->kind != JSON_NUMBER)
+        return false;
+
+    if (v->as.num.is_int)
+        *out = (double)v->as.num.i;
+    else
+        *out = v->as.num.d;
+    return true;
+}
+
+bool json_as_bool(const JsonValue *v, bool *out)
+{
+    if (v->kind != JSON_BOOL)
+        return false;
+
+    *out = v->as.boolean;
     return true;
 }
 
