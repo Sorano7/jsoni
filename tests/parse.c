@@ -12,7 +12,9 @@
 #define PARSE(src) do {                                    \
     if (doc) json_free(doc);                               \
     doc = json_parse((src), sizeof(src)-1, &err);          \
-    CUT_MUST(doc != NULL);                                 \
+    if (doc == NULL)                                       \
+        CUT_FATAL("Failed to parse "#src": %s (%d:%d)",    \
+                err.msg, err.line, err.column);            \
     root = json_root(doc);                                 \
 } while (0)
 
@@ -20,7 +22,8 @@
     (void)root;                                            \
     if (doc) json_free(doc);                               \
     doc = json_parse((src), sizeof(src)-1, &err);          \
-    CUT_MUST(doc == NULL);                                 \
+    if (doc != NULL)                                       \
+        CUT_FATAL("Did not fail to parse "#src);           \
     CUT_CHECK(err.code == c);                              \
 } while (0)
 
@@ -33,6 +36,22 @@ TEST(test_json_empty_source)
 {
     PARSE_START();
         PARSE_FAIL("", JSON_ERR_UNEXPECTED_EOF);
+    PARSE_END();
+}
+
+TEST(test_json_invalid_char)
+{
+    PARSE_START();
+        PARSE_FAIL("%", JSON_ERR_ILLEGAL_CHARACTER);
+    PARSE_END();
+}
+
+TEST(test_json_trailing)
+{
+    PARSE_START();
+        PARSE_FAIL("123abc", JSON_ERR_TRAILING);
+        PARSE_FAIL("null123", JSON_ERR_TRAILING);
+        PARSE_FAIL("\"abc\"123", JSON_ERR_TRAILING);
     PARSE_END();
 }
 
@@ -119,12 +138,40 @@ TEST(test_parse_exponent)
         CUT_MUST(json_as_double(root, &val));
         CUT_CHECK(approx(val, 1e9));
 
+        PARSE("12e+3");
+        CUT_MUST(json_as_double(root, &val));
+        CUT_CHECK(approx(val, 12e+3));
+
         PARSE("-123e-45");
         CUT_MUST(json_as_double(root, &val));
         CUT_CHECK(approx(val, -123e-45));
 
         PARSE_FAIL("123e", JSON_ERR_MISSING_EXPONENT_DIGIT);
         PARSE_FAIL("1e999", JSON_ERR_NUMERIC_RANGE);
+    PARSE_END();
+}
+
+TEST(test_parse_plain_string)
+{
+    PARSE_START();
+        StringView s;
+
+        PARSE("\"hello, world\"");
+        CUT_MUST(s.data = json_as_str(root, &s.len));
+        CUT_CHECK(sv_equal(s, "hello, world"));
+
+        PARSE("\"\"");
+        CUT_MUST(s.data = json_as_str(root, &s.len));
+        CUT_CHECK(sv_equal(s, ""));
+
+        PARSE("\"\\\"abc\\\"\"");
+        CUT_MUST(s.data = json_as_str(root, &s.len));
+        CUT_CHECK(sv_equal(s, "\"abc\""));
+
+        PARSE_FAIL("\"abc",    JSON_ERR_UNTERMINATED_STRING);
+        PARSE_FAIL("\"\\\"",   JSON_ERR_UNTERMINATED_STRING);
+        PARSE_FAIL("\"\\a\"",  JSON_ERR_INVALID_ESCAPE);
+        PARSE_FAIL("\"\x0a\"", JSON_ERR_CONTROL_CHAR);
     PARSE_END();
 }
 

@@ -38,7 +38,7 @@ struct JsonValue
     {
         bool                                         boolean;
         struct { bool is_int; double d; int64_t i; } num;
-        struct { const char *s; size_t len; }        str;
+        struct { const char *data; size_t len; }     str;
     } as;
 };
 
@@ -53,6 +53,7 @@ typedef struct JsonDoc JsonDoc;
 typedef enum
 {
     JSON_ERR_UNEXPECTED_EOF,
+    JSON_ERR_TRAILING,
     JSON_ERR_ILLEGAL_CHARACTER,
     JSON_ERR_INVALID_LITERAL,
 
@@ -60,14 +61,18 @@ typedef enum
     JSON_ERR_MISSING_FRACTION_DIGIT,
     JSON_ERR_MISSING_EXPONENT_DIGIT,
     JSON_ERR_NUMERIC_RANGE,
-
     JSON_ERR_LEADING_ZERO,
     JSON_ERR_LEADING_PLUS,
     JSON_ERR_LEADING_POINT,
+
+    JSON_ERR_UNTERMINATED_STRING,
+    JSON_ERR_INVALID_ESCAPE,
+    JSON_ERR_CONTROL_CHAR,
 } JsonErrorCode;
 
 const char *json_error_messages[] = {
     [JSON_ERR_UNEXPECTED_EOF]         = "Unexpected end of file",
+    [JSON_ERR_TRAILING]               = "Trailing characters",
     [JSON_ERR_ILLEGAL_CHARACTER]      = "Illegal character",
     [JSON_ERR_INVALID_LITERAL]        = "Invalid literal",
 
@@ -75,10 +80,13 @@ const char *json_error_messages[] = {
     [JSON_ERR_MISSING_FRACTION_DIGIT] = "Missing digit after decimal point",
     [JSON_ERR_MISSING_EXPONENT_DIGIT] = "Missing digit after exponent",
     [JSON_ERR_NUMERIC_RANGE]          = "Overflow or underflow in number",
-
     [JSON_ERR_LEADING_ZERO]           = "Leading zeros are not allowed",
     [JSON_ERR_LEADING_PLUS]           = "Leading plus sign is not allowed",
     [JSON_ERR_LEADING_POINT]          = "Leading decimal point is not allowed",
+
+    [JSON_ERR_UNTERMINATED_STRING]    = "Unterminated string",
+    [JSON_ERR_INVALID_ESCAPE]         = "Invalid escape sequence",
+    [JSON_ERR_CONTROL_CHAR]           = "Unescaped control character",
 };
 
 /* Error information. */
@@ -109,6 +117,12 @@ bool json_as_double(const JsonValue *v, double *out);
 
 /* Convert the JSON value into boolean. Returns false on failure. */
 bool json_as_bool(const JsonValue *v, bool *out);
+
+/*
+ * Convert the JSON value into string and set n_out to length.
+ * Returns NULL on failure.
+ */
+const char *json_as_str(const JsonValue *v, size_t *n_out);
 
 #endif // JSONI_H_
 
@@ -269,19 +283,113 @@ static const JsonValue *json__error(JsonParser *p, JsonError *err, JsonErrorCode
     err->code = code;
     err->msg = json_error_messages[code];
     err->line = 0;
+    err->column = 0;
 
-    size_t start = 0;
-    for (; start < p->pos; start++)
+    for (size_t i = 0; i < p->pos; i++)
     {
-        if (p->src[start] == '\n')
+        if (p->src[i] == '\n')
+        {
             err->line++;
+            err->column = 0;
+        }
+        else
+        {
+            err->column++;
+        }
     }
-    err->column = p->pos - start;
 
     return NULL;
 }
 
 static const JsonValue *json__parse(JsonParser *p, JsonError *err);
+
+/*
+ * Find the closing double-quote of a string literal and set out to the length.
+ * Expects the current position to be the first character after the opening quote.
+ * Return false if the string is not terminated.
+ */
+static bool json__find_closing_quotes(JsonParser *p, size_t *out, JsonError *err)
+{
+    size_t start = p->pos;
+    for (; !json__is_eof(p); p->pos++)
+    {
+        unsigned char c = json__chr(p);
+        if (c == '"') break;
+        if (c == '\\') p->pos++;
+    }
+    if (json__is_eof(p) || json__chr(p) != '"')
+        return json__error(p, err, JSON_ERR_UNTERMINATED_STRING);
+
+    *out = p->pos - start;
+    p->pos = start;
+    return true;
+}
+
+/* Parse a JSON string value. */
+static const JsonValue *json__parse_string(JsonParser *p, JsonError *err)
+{
+    p->pos++;
+    const unsigned char *s = (unsigned char *)json__str(p);
+
+    size_t ilen = 0;
+    if (!json__find_closing_quotes(p, &ilen, err))
+        return NULL;
+    char *out = json__alloc(p->doc, ilen);
+    size_t olen = 0;
+
+    size_t i = 0;
+    for (; i < ilen; i++)
+    {
+        unsigned char c = s[i];
+        if (c == '"') break;
+        if (c < 0x20)
+            return (void *)json__error(p, err, JSON_ERR_CONTROL_CHAR);
+
+        if (c == '\\')
+        {
+            if (++i >= ilen)
+                return (void *)json__error(p, err, JSON_ERR_UNTERMINATED_STRING);
+
+            unsigned long cp;
+            switch (c = s[i])
+            {
+                case '"':  cp = '"';  break;
+                case '\\': cp = '\\'; break;
+                case '/':  cp = '/';  break;
+                case 'b':  cp = '\b'; break;
+                case 'f':  cp = '\f'; break;
+                case 'n':  cp = '\n'; break;
+                case 'r':  cp = '\r'; break;
+                case 't':  cp = '\t'; break;
+
+                case 'u':
+                {
+                    assert("unicode escape not implemented" && false);
+                }
+
+                default:
+                    return (void *)json__error(p, err, JSON_ERR_INVALID_ESCAPE);
+            }
+
+            out[olen++] = (unsigned char)cp;
+        }
+        else if (c < 0x80)
+        {
+            out[olen++] = c;
+        }
+        else
+        {
+            assert("utf8 validation not implemented" && false);
+        }
+    }
+    p->pos += ++i;
+
+    JsonValue *v = json__alloc(p->doc, sizeof(*v));
+    v->kind = JSON_STRING;
+    v->as.str.data = out;
+    v->as.str.len = olen;
+    return v;
+}
 
 /* Parse a JSON number value. */
 static const JsonValue *json__parse_number(JsonParser *p, JsonError *err)
@@ -355,16 +463,19 @@ static const JsonValue *json__parse_literal(JsonParser *p, JsonError *err)
     if (json__parser_match_str(p, "null",  4))
     {
         v->kind = JSON_NULL;
+        p->pos += 4;
     }
     else if (json__parser_match_str(p, "true",  4))
     {
         v->kind = JSON_BOOL;
         v->as.boolean = true;
+        p->pos += 4;
     }
     else if (json__parser_match_str(p, "false", 5))
     {
         v->kind = JSON_BOOL;
         v->as.boolean = false;
+        p->pos += 5;
     }
     else
     {
@@ -392,6 +503,9 @@ static const JsonValue *json__parse(JsonParser *p, JsonError *err)
     if (json__is_digit(p) || json__chr(p) == '-')
         return json__parse_number(p, err);
 
+    if (json__chr(p) == '"')
+        return json__parse_string(p, err);
+
     if (isalpha(json__chr(p)))
         return json__parse_literal(p, err);
 
@@ -416,6 +530,11 @@ JsonDoc *json_parse(const char *src, size_t len, JsonError *err)
         json_free(doc);
         return NULL;
     }
+    if (!json__is_eof(&parser))
+    {
+        json_free(doc);
+        return (void *)json__error(&parser, err, JSON_ERR_TRAILING);
+    }
 
     return doc;
 }
@@ -427,7 +546,7 @@ const JsonValue *json_root(const JsonDoc *doc)
 
 bool json_as_int64(const JsonValue *v, int64_t *out)
 {
-    if (v->kind != JSON_NUMBER)
+    if (!v || v->kind != JSON_NUMBER)
         return false;
 
     if (!v->as.num.is_int)
@@ -445,7 +564,7 @@ bool json_as_int64(const JsonValue *v, int64_t *out)
 
 bool json_as_double(const JsonValue *v, double *out)
 {
-    if (v->kind != JSON_NUMBER)
+    if (!v || v->kind != JSON_NUMBER)
         return false;
 
     if (v->as.num.is_int)
@@ -457,11 +576,20 @@ bool json_as_double(const JsonValue *v, double *out)
 
 bool json_as_bool(const JsonValue *v, bool *out)
 {
-    if (v->kind != JSON_BOOL)
+    if (!v || v->kind != JSON_BOOL)
         return false;
 
     *out = v->as.boolean;
     return true;
+}
+
+const char *json_as_str(const JsonValue *v, size_t *n_out)
+{
+    if (!v || v->kind != JSON_STRING)
+        return NULL;
+
+    *n_out = v->as.str.len;
+    return v->as.str.data;
 }
 
 #endif // JSONI_IMPL
