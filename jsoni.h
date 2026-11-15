@@ -243,8 +243,8 @@ typedef struct
 #define json__is_digit(p) (!json__is_eof(p) && isdigit(json__chr(p)))
 
 /* Advance parser until the next non-whitespace character or EOF. */
-#define json__skip_ws(p) do {                                \
-    while (!json__is_eof(p) && isspace(json__chr(p))) \
+#define json__skip_ws(p) do {                                       \
+    while (!json__is_eof(p) && isspace(json__chr(p)))               \
         (p)->pos++;                                                 \
 } while (0)
 
@@ -391,6 +391,13 @@ static const JsonValue *json__parse_string(JsonParser *p, JsonError *err)
     return v;
 }
 
+/* Skip digits or return err_code if missing first digit */
+#define json__skip_digits(p, err, err_code) do {    \
+    if (!json__is_digit(p))                         \
+        return json__error((p), (err), (err_code)); \
+    while (json__is_digit(p)) (p)->pos++;           \
+} while (0)
+
 /* Parse a JSON number value. */
 static const JsonValue *json__parse_number(JsonParser *p, JsonError *err)
 {
@@ -404,18 +411,14 @@ static const JsonValue *json__parse_number(JsonParser *p, JsonError *err)
 
     if (json__chr(p) == '0')
         return json__error(p, err, JSON_ERR_LEADING_ZERO);
-    if (!json__is_digit(p))
-        return json__error(p, err, JSON_ERR_MISSING_DIGIT);
-    while (json__is_digit(p)) p->pos++;
+    json__skip_digits(p, err, JSON_ERR_MISSING_DIGIT);
 
     if (json__chr(p) == '.')
     {
         v->as.num.is_int = false;
         p->pos++;
 
-        if (!json__is_digit(p))
-            return json__error(p, err, JSON_ERR_MISSING_FRACTION_DIGIT);
-        while (json__is_digit(p)) p->pos++;
+        json__skip_digits(p, err, JSON_ERR_MISSING_FRACTION_DIGIT);
     }
 
     if (json__chr(p) == 'e')
@@ -426,9 +429,7 @@ static const JsonValue *json__parse_number(JsonParser *p, JsonError *err)
         if (json__chr(p) == '-' || json__chr(p) == '+')
             p->pos++;
 
-        if (!json__is_digit(p))
-            return json__error(p, err, JSON_ERR_MISSING_EXPONENT_DIGIT);
-        while (json__is_digit(p)) p->pos++;
+        json__skip_digits(p, err, JSON_ERR_MISSING_EXPONENT_DIGIT);
     }
 
     size_t len = p->pos - start;
@@ -442,6 +443,7 @@ static const JsonValue *json__parse_number(JsonParser *p, JsonError *err)
         v->as.num.i = strtoll(buffer, NULL, 10);
     }
 
+    // Has fraction/exponent part or cannot fit into int64
     if (!v->as.num.is_int || errno == ERANGE)
     {
         v->as.num.is_int = false;
