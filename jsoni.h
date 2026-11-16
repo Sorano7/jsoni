@@ -49,44 +49,34 @@ struct JsonValue
 /* A JSON document. */
 typedef struct JsonDoc JsonDoc;
 
+#define json__error_codes(XX) \
+    XX(JSON_ERR_UNEXPECTED_EOF,         "Unexpected end of file")                \
+    XX(JSON_ERR_TRAILING,               "Trailing characters")                   \
+    XX(JSON_ERR_ILLEGAL_CHARACTER,      "Illegal character")                     \
+    XX(JSON_ERR_INVALID_LITERAL,        "Invalid literal")                       \
+                                                                                 \
+    XX(JSON_ERR_MISSING_DIGIT,          "Missing digit in number")               \
+    XX(JSON_ERR_MISSING_FRACTION_DIGIT, "Missing digit after decimal point")     \
+    XX(JSON_ERR_MISSING_EXPONENT_DIGIT, "Missing digit after exponent")          \
+    XX(JSON_ERR_NUMERIC_RANGE,          "Overflow or underflow in number")       \
+    XX(JSON_ERR_LEADING_ZERO,           "Leading zeros are not allowed")         \
+    XX(JSON_ERR_LEADING_PLUS,           "Leading plus sign is not allowed")      \
+    XX(JSON_ERR_LEADING_POINT,          "Leading decimal point is not allowed")  \
+                                                                                 \
+    XX(JSON_ERR_UNTERMINATED_STRING,    "Unterminated string")                   \
+    XX(JSON_ERR_INVALID_ESCAPE,         "Invalid escape sequence")               \
+    XX(JSON_ERR_CONTROL_CHAR,           "Unescaped control character")
+
+#define json__enum_member(M, ...) M,
+#define json__enum_as_str(M, S) [M] = S,
+
 /* JSON error codes. */
-typedef enum
-{
-    JSON_ERR_UNEXPECTED_EOF,
-    JSON_ERR_TRAILING,
-    JSON_ERR_ILLEGAL_CHARACTER,
-    JSON_ERR_INVALID_LITERAL,
-
-    JSON_ERR_MISSING_DIGIT,
-    JSON_ERR_MISSING_FRACTION_DIGIT,
-    JSON_ERR_MISSING_EXPONENT_DIGIT,
-    JSON_ERR_NUMERIC_RANGE,
-    JSON_ERR_LEADING_ZERO,
-    JSON_ERR_LEADING_PLUS,
-    JSON_ERR_LEADING_POINT,
-
-    JSON_ERR_UNTERMINATED_STRING,
-    JSON_ERR_INVALID_ESCAPE,
-    JSON_ERR_CONTROL_CHAR,
+typedef enum {
+    json__error_codes(json__enum_member)
 } JsonErrorCode;
 
 const char *json_error_messages[] = {
-    [JSON_ERR_UNEXPECTED_EOF]         = "Unexpected end of file",
-    [JSON_ERR_TRAILING]               = "Trailing characters",
-    [JSON_ERR_ILLEGAL_CHARACTER]      = "Illegal character",
-    [JSON_ERR_INVALID_LITERAL]        = "Invalid literal",
-
-    [JSON_ERR_MISSING_DIGIT]          = "Missing digit in number",
-    [JSON_ERR_MISSING_FRACTION_DIGIT] = "Missing digit after decimal point",
-    [JSON_ERR_MISSING_EXPONENT_DIGIT] = "Missing digit after exponent",
-    [JSON_ERR_NUMERIC_RANGE]          = "Overflow or underflow in number",
-    [JSON_ERR_LEADING_ZERO]           = "Leading zeros are not allowed",
-    [JSON_ERR_LEADING_PLUS]           = "Leading plus sign is not allowed",
-    [JSON_ERR_LEADING_POINT]          = "Leading decimal point is not allowed",
-
-    [JSON_ERR_UNTERMINATED_STRING]    = "Unterminated string",
-    [JSON_ERR_INVALID_ESCAPE]         = "Invalid escape sequence",
-    [JSON_ERR_CONTROL_CHAR]           = "Unescaped control character",
+    json__error_codes(json__enum_as_str)
 };
 
 /* Error information. */
