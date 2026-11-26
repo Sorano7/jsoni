@@ -36,9 +36,10 @@ struct JsonValue
     JsonKind kind;
     union
     {
-        bool                                         boolean;
-        struct { bool is_int; double d; int64_t i; } num;
-        struct { const char *data; size_t len; }     str;
+        bool                                          boolean;
+        struct { bool is_int; double d; int64_t i; }  num;
+        struct { const char *data; size_t len; }      str;
+        struct { const JsonValue *data; size_t len; } arr;
     } as;
 };
 
@@ -65,7 +66,9 @@ typedef struct JsonDoc JsonDoc;
                                                                                  \
     XX(JSON_ERR_UNTERMINATED_STRING,    "Unterminated string")                   \
     XX(JSON_ERR_INVALID_ESCAPE,         "Invalid escape sequence")               \
-    XX(JSON_ERR_CONTROL_CHAR,           "Unescaped control character")
+    XX(JSON_ERR_CONTROL_CHAR,           "Unescaped control character")           \
+                                                                                 \
+    XX(JSON_ERR_UNTERMINATED_ARRAY,     "Unterminated array")
 
 #define json__enum_member(M, ...) M,
 #define json__enum_as_str(M, S) [M] = S,
@@ -114,6 +117,9 @@ bool json_as_bool(const JsonValue *v, bool *out);
  */
 const char *json_as_str(const JsonValue *v, size_t *n_out);
 
+const JsonValue *json_array_get(const JsonValue *v, size_t i);
+bool json_array_length(const JsonValue *v, size_t *out);
+
 #endif // JSONI_H_
 
 
@@ -147,7 +153,7 @@ struct JsonDoc
 };
 
 /* Allocate n in the JSON document's arena. */
-static void *json__alloc(JsonDoc *doc, size_t n)
+static void *json__arena_alloc(JsonDoc *doc, size_t n)
 {
     n = (n + (JSONI_CHUNK_ALIGN-1)) & ~(size_t)(JSONI_CHUNK_ALIGN-1);
     JsonChunk *c = doc->head;
@@ -210,13 +216,67 @@ static JsonDoc *json__doc_create(void)
     return doc;
 }
 
+typedef struct
+{
+    JsonValue *data;
+    size_t len, cap;
+} JsonValueStack;
+
+#define json__da_free(da) do {        \
+    if ((da)->data) free((da)->data); \
+} while (0)
+
+#define json__da_grow(da) do {                                             \
+    if ((da)->len >= (da)->cap) {                                          \
+        (da)->cap = (da)->cap == 0 ? 64 : (da)->cap * 2;                   \
+        (da)->data = realloc((da)->data, (da)->cap * sizeof(*(da)->data)); \
+        if (!(da)->data) abort();                                          \
+    }                                                                      \
+    (da)->len++;                                                           \
+} while (0)
+
+#define json__da_last(da) (&(da)->data[(da)->len-1])
+
+typedef enum
+{
+    JSON_ALLOC_ARENA,
+    JSON_ALLOC_VALUE_STACK,
+} JsonAllocTarget;
+
 /* Private JSON parser type. */
 typedef struct
 {
     const char *src;
     size_t len, pos;
     JsonDoc *doc;
+
+    JsonAllocTarget alloc_target;
+    JsonValueStack value_stack;
 } JsonParser;
+
+static void *json__alloc(JsonParser *p, size_t n)
+{
+    switch (p->alloc_target)
+    {
+        case JSON_ALLOC_ARENA:
+            return json__arena_alloc(p->doc, n);
+
+        case JSON_ALLOC_VALUE_STACK:
+            json__da_grow(&p->value_stack);
+            return json__da_last(&p->value_stack);
+
+        default:
+            assert("unreachable" && false);
+    }
+}
+
+#define json__array_start(p) do { \
+    (p)->alloc_target = JSON_ALLOC_VALUE_STACK; \
+} while (0)
+
+#define json__container_end(p) do { \
+    (p)->alloc_target = JSON_ALLOC_ARENA; \
+} while (0)
 
 /* Whether the parser is at EOF. */
 #define json__is_eof(p) ((p)->pos >= (p)->len)
@@ -324,7 +384,7 @@ static const JsonValue *json__parse_string(JsonParser *p, JsonError *err)
     size_t ilen = 0;
     if (!json__find_closing_quotes(p, &ilen, err))
         return NULL;
-    char *out = json__alloc(p->doc, ilen);
+    char *out = json__arena_alloc(p->doc, ilen);
     size_t olen = 0;
 
     size_t i = 0;
@@ -374,7 +434,7 @@ static const JsonValue *json__parse_string(JsonParser *p, JsonError *err)
     }
     p->pos += ++i;
 
-    JsonValue *v = json__alloc(p->doc, sizeof(*v));
+    JsonValue *v = json__alloc(p, sizeof(*v));
     v->kind = JSON_STRING;
     v->as.str.data = out;
     v->as.str.len = olen;
@@ -391,7 +451,7 @@ static const JsonValue *json__parse_string(JsonParser *p, JsonError *err)
 /* Parse a JSON number value. */
 static const JsonValue *json__parse_number(JsonParser *p, JsonError *err)
 {
-    JsonValue *v = json__alloc(p->doc, sizeof(*v));
+    JsonValue *v = json__alloc(p, sizeof(*v));
     v->kind = JSON_NUMBER;
     v->as.num.is_int = true;
 
@@ -450,7 +510,7 @@ static const JsonValue *json__parse_number(JsonParser *p, JsonError *err)
 /* Parse a literal name (null, true, or false). */
 static const JsonValue *json__parse_literal(JsonParser *p, JsonError *err)
 {
-    JsonValue *v = json__alloc(p->doc, sizeof(*v));
+    JsonValue *v = json__alloc(p, sizeof(*v));
 
     if (json__parser_match_str(p, "null",  4))
     {
@@ -476,6 +536,53 @@ static const JsonValue *json__parse_literal(JsonParser *p, JsonError *err)
     return v;
 }
 
+static const JsonValue *json__parse_array(JsonParser *p, JsonError *err)
+{
+    p->pos++;
+
+    JsonValue *v = json__alloc(p, sizeof(*v));
+    v->kind = JSON_ARRAY;
+
+    json__array_start(p);
+    size_t stack_start = p->value_stack.len;
+
+    for (;;)
+    {
+        if (!json__parse(p, err))
+            return NULL;
+
+        if (json__is_eof(p))
+            return json__error(p, err, JSON_ERR_UNEXPECTED_EOF);
+
+        if (json__chr(p) == ']')
+            break;
+
+        if (json__chr(p) == ',')
+        {
+            p->pos++;
+            continue;
+        }
+
+        return json__error(p, err, JSON_ERR_UNTERMINATED_ARRAY);
+    }
+
+    if (json__chr(p) != ']')
+        return json__error(p, err, JSON_ERR_UNTERMINATED_ARRAY);
+    p->pos++;
+
+    v->as.arr.len = p->value_stack.len - stack_start;
+    size_t arr_size = v->as.arr.len * sizeof(JsonValue);
+
+    JsonValue *data = json__arena_alloc(p->doc, arr_size);
+    memcpy(data, p->value_stack.data + stack_start, arr_size);
+    v->as.arr.data = data;
+
+    p->value_stack.len = stack_start;
+
+    json__container_end(p);
+    return v;
+}
+
 /* Parse a JSON value, return NULL if error. */
 static const JsonValue *json__parse(JsonParser *p, JsonError *err)
 {
@@ -487,21 +594,28 @@ static const JsonValue *json__parse(JsonParser *p, JsonError *err)
     if (json__is_eof(p))
         return json__error(p, err, JSON_ERR_UNEXPECTED_EOF);
 
-    if (json__chr(p) == '+')
-        return json__error(p, err, JSON_ERR_LEADING_PLUS);
-    if (json__chr(p) == '.')
-        return json__error(p, err, JSON_ERR_LEADING_POINT);
+    char c = json__chr(p);
 
-    if (json__is_digit(p) || json__chr(p) == '-')
+    if (isdigit(c) || c == '-')
         return json__parse_number(p, err);
 
-    if (json__chr(p) == '"')
-        return json__parse_string(p, err);
-
-    if (isalpha(json__chr(p)))
+    if (isalpha(c))
         return json__parse_literal(p, err);
 
-    return json__error(p, err, JSON_ERR_ILLEGAL_CHARACTER);
+    switch (c)
+    {
+        case '+':
+            return json__error(p, err, JSON_ERR_LEADING_PLUS);
+        case '.':
+            return json__error(p, err, JSON_ERR_LEADING_POINT);
+        case '"':
+            return json__parse_string(p, err);
+        case '[':
+            return json__parse_array(p, err);
+        default:
+            return json__error(p, err, JSON_ERR_ILLEGAL_CHARACTER);
+    }
+
 }
 
 JsonDoc *json_parse(const char *src, size_t len, JsonError *err)
@@ -512,21 +626,31 @@ JsonDoc *json_parse(const char *src, size_t len, JsonError *err)
     JsonDoc *doc = json__doc_create();
 
     JsonParser parser = {
-        .src = src, .len = len,
-        .pos = 0,   .doc = doc,
+        .src          = src,
+        .len          = len,
+        .pos          = 0,
+        .doc          = doc,
+        .alloc_target = JSON_ALLOC_ARENA,
     };
 
     doc->root = json__parse(&parser, err);
     if (!doc->root)
-    {
-        json_free(doc);
-        return NULL;
-    }
+        goto error;
+
     if (!json__is_eof(&parser))
     {
-        json_free(doc);
-        return (void *)json__error(&parser, err, JSON_ERR_TRAILING);
+        json__error(&parser, err, JSON_ERR_TRAILING);
+        goto error;
     }
+
+    goto cleanup;
+
+error:
+    json_free(doc);
+    doc = NULL;
+
+cleanup:
+    json__da_free(&parser.value_stack);
 
     return doc;
 }
@@ -582,6 +706,25 @@ const char *json_as_str(const JsonValue *v, size_t *n_out)
 
     *n_out = v->as.str.len;
     return v->as.str.data;
+}
+
+const JsonValue *json_array_get(const JsonValue *v, size_t i)
+{
+    if (!v || v->kind != JSON_ARRAY)
+        return NULL;
+
+    if (i >= v->as.arr.len)
+        return NULL;
+
+    return &v->as.arr.data[i];
+}
+
+bool json_array_length(const JsonValue *v, size_t *out)
+{
+    if (!v || v->kind != JSON_ARRAY)
+        return false;
+    *out = v->as.arr.len;
+    return true;
 }
 
 #endif // JSONI_IMPL

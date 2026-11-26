@@ -175,4 +175,30 @@ TEST(test_parse_plain_string)
     PARSE_END();
 }
 
+TEST(test_parse_array)
+{
+    PARSE_START();
+        size_t sz;
+        int64_t int_val;
+        StringView str_val;
+        bool bool_val;
+
+        PARSE("[1, \"hello\", true]");
+        CUT_MUST(json_array_length(root, &sz));
+        CUT_CHECK(sz == 3);
+
+        const JsonValue *v1 = json_array_get(root, 0);
+        CUT_MUST(json_as_int64(v1, &int_val));
+        CUT_CHECK(int_val == 1);
+
+        const JsonValue *v2 = json_array_get(root, 1);
+        CUT_MUST(str_val.data = json_as_str(v2, &str_val.len));
+        CUT_CHECK(sv_equal(str_val, "hello"));
+
+        const JsonValue *v3 = json_array_get(root, 2);
+        CUT_MUST(json_as_bool(v3, &bool_val));
+        CUT_CHECK(bool_val == true);
+    PARSE_END();
+}
+
 TEST_RUN()
