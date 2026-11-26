@@ -674,6 +674,7 @@ cleanup:
 
 const JsonValue *json_root(const JsonDoc *doc)
 {
+    if (!doc) return NULL;
     return doc->root;
 }
 
@@ -682,15 +683,18 @@ bool json_as_int64(const JsonValue *v, int64_t *out)
     if (!v || v->kind != JSON_NUMBER)
         return false;
 
-    if (!v->as.num.is_int)
+    if (out)
     {
-        if (v->as.num.d > (long double)INT64_MAX)
-            return false;
-        *out = (int64_t)v->as.num.d;
-    }
-    else
-    {
-        *out = v->as.num.i;
+        if (!v->as.num.is_int)
+        {
+            if (v->as.num.d > (long double)INT64_MAX)
+                return false;
+            *out = (int64_t)v->as.num.d;
+        }
+        else
+        {
+            *out = v->as.num.i;
+        }
     }
     return true;
 }
@@ -700,10 +704,13 @@ bool json_as_double(const JsonValue *v, double *out)
     if (!v || v->kind != JSON_NUMBER)
         return false;
 
-    if (v->as.num.is_int)
-        *out = (double)v->as.num.i;
-    else
-        *out = v->as.num.d;
+    if (out)
+    {
+        if (v->as.num.is_int)
+            *out = (double)v->as.num.i;
+        else
+            *out = v->as.num.d;
+    }
     return true;
 }
 
@@ -712,7 +719,8 @@ bool json_as_bool(const JsonValue *v, bool *out)
     if (!v || v->kind != JSON_BOOL)
         return false;
 
-    *out = v->as.boolean;
+    if (out)
+        *out = v->as.boolean;
     return true;
 }
 
@@ -721,7 +729,8 @@ const char *json_as_str(const JsonValue *v, size_t *n_out)
     if (!v || v->kind != JSON_STRING)
         return NULL;
 
-    *n_out = v->as.str.len;
+    if (n_out)
+        *n_out = v->as.str.len;
     return v->as.str.data;
 }
 
@@ -740,7 +749,9 @@ bool json_array_length(const JsonValue *v, size_t *out)
 {
     if (!v || v->kind != JSON_ARRAY)
         return false;
-    *out = v->as.arr.len;
+
+    if (out)
+        *out = v->as.arr.len;
     return true;
 }
 
