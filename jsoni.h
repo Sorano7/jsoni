@@ -50,9 +50,9 @@ struct JsonValue
 /* A JSON document. */
 typedef struct JsonDoc JsonDoc;
 
-#define json__error_codes(XX) \
+#define json__error_codes(XX)                                                    \
     XX(JSON_ERR_UNEXPECTED_EOF,         "Unexpected end of file")                \
-    XX(JSON_ERR_TRAILING,               "Trailing characters")                   \
+    XX(JSON_ERR_TRAILING_CHAR,               "Trailing characters")                   \
     XX(JSON_ERR_ILLEGAL_CHARACTER,      "Illegal character")                     \
     XX(JSON_ERR_INVALID_LITERAL,        "Invalid literal")                       \
                                                                                  \
@@ -68,7 +68,8 @@ typedef struct JsonDoc JsonDoc;
     XX(JSON_ERR_INVALID_ESCAPE,         "Invalid escape sequence")               \
     XX(JSON_ERR_CONTROL_CHAR,           "Unescaped control character")           \
                                                                                  \
-    XX(JSON_ERR_UNTERMINATED_ARRAY,     "Unterminated array")
+    XX(JSON_ERR_UNTERMINATED_ARRAY,     "Unterminated array")                    \
+    XX(JSON_ERR_TRAILING_COMMA,         "Trailing comma")                        \
 
 #define json__enum_member(M, ...) M,
 #define json__enum_as_str(M, S) [M] = S,
@@ -117,7 +118,10 @@ bool json_as_bool(const JsonValue *v, bool *out);
  */
 const char *json_as_str(const JsonValue *v, size_t *n_out);
 
+/* Get the JSON value from v[i]. Returns null on failure. */
 const JsonValue *json_array_get(const JsonValue *v, size_t i);
+
+/* Get the array length from the JSON value. Returns false on failure. */
 bool json_array_length(const JsonValue *v, size_t *out);
 
 #endif // JSONI_H_
@@ -539,20 +543,32 @@ static const JsonValue *json__parse_literal(JsonParser *p, JsonError *err)
 static const JsonValue *json__parse_array(JsonParser *p, JsonError *err)
 {
     p->pos++;
+    json__skip_ws(p);
 
     JsonValue *v = json__alloc(p, sizeof(*v));
     v->kind = JSON_ARRAY;
+    v->as.arr.len = 0;
+    v->as.arr.data = NULL;
+
+    if (json__chr(p) == ']')
+    {
+        p->pos++;
+        return v;
+    }
+
+    bool nested = p->alloc_target != JSON_ALLOC_ARENA;
 
     json__array_start(p);
     size_t stack_start = p->value_stack.len;
 
-    for (;;)
+    while (!json__is_eof(p))
     {
         if (!json__parse(p, err))
             return NULL;
 
-        if (json__is_eof(p))
-            return json__error(p, err, JSON_ERR_UNEXPECTED_EOF);
+        v->as.arr.len++;
+
+        json__skip_ws(p);
 
         if (json__chr(p) == ']')
             break;
@@ -560,26 +576,27 @@ static const JsonValue *json__parse_array(JsonParser *p, JsonError *err)
         if (json__chr(p) == ',')
         {
             p->pos++;
-            continue;
+            json__skip_ws(p);
+            if (json__chr(p) == ']')
+                return json__error(p, err, JSON_ERR_TRAILING_COMMA);
         }
-
-        return json__error(p, err, JSON_ERR_UNTERMINATED_ARRAY);
     }
 
     if (json__chr(p) != ']')
         return json__error(p, err, JSON_ERR_UNTERMINATED_ARRAY);
     p->pos++;
 
-    v->as.arr.len = p->value_stack.len - stack_start;
-    size_t arr_size = v->as.arr.len * sizeof(JsonValue);
+    if (v->as.arr.len > 0)
+    {
+        size_t arr_size = v->as.arr.len * sizeof(JsonValue);
+        JsonValue *data = json__arena_alloc(p->doc, arr_size);
+        memcpy(data, p->value_stack.data + stack_start, arr_size);
+        v->as.arr.data = data;
 
-    JsonValue *data = json__arena_alloc(p->doc, arr_size);
-    memcpy(data, p->value_stack.data + stack_start, arr_size);
-    v->as.arr.data = data;
+        p->value_stack.len = stack_start;
+    }
 
-    p->value_stack.len = stack_start;
-
-    json__container_end(p);
+    if (!nested) json__container_end(p);
     return v;
 }
 
@@ -639,7 +656,7 @@ JsonDoc *json_parse(const char *src, size_t len, JsonError *err)
 
     if (!json__is_eof(&parser))
     {
-        json__error(&parser, err, JSON_ERR_TRAILING);
+        json__error(&parser, err, JSON_ERR_TRAILING_CHAR);
         goto error;
     }
 
