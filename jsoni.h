@@ -52,7 +52,7 @@ typedef struct JsonDoc JsonDoc;
 
 #define json__error_codes(XX)                                                    \
     XX(JSON_ERR_UNEXPECTED_EOF,         "Unexpected end of file")                \
-    XX(JSON_ERR_TRAILING_CHAR,               "Trailing characters")                   \
+    XX(JSON_ERR_TRAILING_CHAR,          "Trailing characters")                   \
     XX(JSON_ERR_ILLEGAL_CHARACTER,      "Illegal character")                     \
     XX(JSON_ERR_INVALID_LITERAL,        "Invalid literal")                       \
                                                                                  \
@@ -220,16 +220,19 @@ static JsonDoc *json__doc_create(void)
     return doc;
 }
 
+/* A temporary stack of JSON values */
 typedef struct
 {
     JsonValue *data;
     size_t len, cap;
 } JsonValueStack;
 
+/* Free a dynamic array */
 #define json__da_free(da) do {        \
     if ((da)->data) free((da)->data); \
 } while (0)
 
+/* Grow or initialize a dynamic array by one */
 #define json__da_grow(da) do {                                             \
     if ((da)->len >= (da)->cap) {                                          \
         (da)->cap = (da)->cap == 0 ? 64 : (da)->cap * 2;                   \
@@ -239,13 +242,8 @@ typedef struct
     (da)->len++;                                                           \
 } while (0)
 
+/* Get the last slot of the dynamic array */
 #define json__da_last(da) (&(da)->data[(da)->len-1])
-
-typedef enum
-{
-    JSON_ALLOC_ARENA,
-    JSON_ALLOC_VALUE_STACK,
-} JsonAllocTarget;
 
 /* Private JSON parser type. */
 typedef struct
@@ -254,33 +252,25 @@ typedef struct
     size_t len, pos;
     JsonDoc *doc;
 
-    JsonAllocTarget alloc_target;
     JsonValueStack value_stack;
 } JsonParser;
 
-static void *json__alloc(JsonParser *p, size_t n)
+/* Allocate a JSON value and set the kind */
+static inline JsonValue *json__value_alloc(JsonParser *p, JsonKind kind, bool in_array)
 {
-    switch (p->alloc_target)
+    JsonValue *v;
+    if (in_array)
     {
-        case JSON_ALLOC_ARENA:
-            return json__arena_alloc(p->doc, n);
-
-        case JSON_ALLOC_VALUE_STACK:
-            json__da_grow(&p->value_stack);
-            return json__da_last(&p->value_stack);
-
-        default:
-            assert("unreachable" && false);
+        json__da_grow(&p->value_stack);
+        v = json__da_last(&p->value_stack);
     }
+    else
+    {
+        v = json__arena_alloc(p->doc, sizeof(*v));
+    }
+    v->kind = kind;
+    return v;
 }
-
-#define json__array_start(p) do { \
-    (p)->alloc_target = JSON_ALLOC_VALUE_STACK; \
-} while (0)
-
-#define json__container_end(p) do { \
-    (p)->alloc_target = JSON_ALLOC_ARENA; \
-} while (0)
 
 /* Whether the parser is at EOF. */
 #define json__is_eof(p) ((p)->pos >= (p)->len)
@@ -355,7 +345,7 @@ static const JsonValue *json__error(JsonParser *p, JsonError *err, JsonErrorCode
     return NULL;
 }
 
-static const JsonValue *json__parse(JsonParser *p, JsonError *err);
+static const JsonValue *json__parse(JsonParser *p, JsonError *err, bool in_array);
 
 /*
  * Find the closing double-quote of a string literal and set out to the length.
@@ -365,6 +355,7 @@ static const JsonValue *json__parse(JsonParser *p, JsonError *err);
 static bool json__find_closing_quotes(JsonParser *p, size_t *out, JsonError *err)
 {
     size_t start = p->pos;
+
     for (; !json__is_eof(p); p->pos++)
     {
         unsigned char c = json__chr(p);
@@ -380,7 +371,7 @@ static bool json__find_closing_quotes(JsonParser *p, size_t *out, JsonError *err
 }
 
 /* Parse a JSON string value. */
-static const JsonValue *json__parse_string(JsonParser *p, JsonError *err)
+static const JsonValue *json__parse_string(JsonParser *p, JsonError *err, bool in_array)
 {
     p->pos++;
     const unsigned char *s = (unsigned char *)json__str(p);
@@ -438,8 +429,7 @@ static const JsonValue *json__parse_string(JsonParser *p, JsonError *err)
     }
     p->pos += ++i;
 
-    JsonValue *v = json__alloc(p, sizeof(*v));
-    v->kind = JSON_STRING;
+    JsonValue *v = json__value_alloc(p, JSON_STRING, in_array);
     v->as.str.data = out;
     v->as.str.len = olen;
     return v;
@@ -453,10 +443,9 @@ static const JsonValue *json__parse_string(JsonParser *p, JsonError *err)
 } while (0)
 
 /* Parse a JSON number value. */
-static const JsonValue *json__parse_number(JsonParser *p, JsonError *err)
+static const JsonValue *json__parse_number(JsonParser *p, JsonError *err, bool in_array)
 {
-    JsonValue *v = json__alloc(p, sizeof(*v));
-    v->kind = JSON_NUMBER;
+    JsonValue *v = json__value_alloc(p, JSON_NUMBER, in_array);
     v->as.num.is_int = true;
 
     size_t start = p->pos;
@@ -512,9 +501,9 @@ static const JsonValue *json__parse_number(JsonParser *p, JsonError *err)
 }
 
 /* Parse a literal name (null, true, or false). */
-static const JsonValue *json__parse_literal(JsonParser *p, JsonError *err)
+static const JsonValue *json__parse_literal(JsonParser *p, JsonError *err, bool in_array)
 {
-    JsonValue *v = json__alloc(p, sizeof(*v));
+    JsonValue *v = json__value_alloc(p, JSON_NULL, in_array);
 
     if (json__parser_match_str(p, "null",  4))
     {
@@ -540,13 +529,13 @@ static const JsonValue *json__parse_literal(JsonParser *p, JsonError *err)
     return v;
 }
 
-static const JsonValue *json__parse_array(JsonParser *p, JsonError *err)
+/* Parse an array of JSON values */
+static const JsonValue *json__parse_array(JsonParser *p, JsonError *err, bool in_array)
 {
     p->pos++;
     json__skip_ws(p);
 
-    JsonValue *v = json__alloc(p, sizeof(*v));
-    v->kind = JSON_ARRAY;
+    JsonValue *v = json__value_alloc(p, JSON_ARRAY, in_array);
     v->as.arr.len = 0;
     v->as.arr.data = NULL;
 
@@ -556,14 +545,11 @@ static const JsonValue *json__parse_array(JsonParser *p, JsonError *err)
         return v;
     }
 
-    bool nested = p->alloc_target != JSON_ALLOC_ARENA;
-
-    json__array_start(p);
     size_t stack_start = p->value_stack.len;
 
     while (!json__is_eof(p))
     {
-        if (!json__parse(p, err))
+        if (!json__parse(p, err, true))
             return NULL;
 
         v->as.arr.len++;
@@ -596,12 +582,11 @@ static const JsonValue *json__parse_array(JsonParser *p, JsonError *err)
         p->value_stack.len = stack_start;
     }
 
-    if (!nested) json__container_end(p);
     return v;
 }
 
 /* Parse a JSON value, return NULL if error. */
-static const JsonValue *json__parse(JsonParser *p, JsonError *err)
+static const JsonValue *json__parse(JsonParser *p, JsonError *err, bool in_array)
 {
     if (p->len == 0)
         return json__error(p, err, JSON_ERR_UNEXPECTED_EOF);
@@ -614,10 +599,10 @@ static const JsonValue *json__parse(JsonParser *p, JsonError *err)
     char c = json__chr(p);
 
     if (isdigit(c) || c == '-')
-        return json__parse_number(p, err);
+        return json__parse_number(p, err, in_array);
 
     if (isalpha(c))
-        return json__parse_literal(p, err);
+        return json__parse_literal(p, err, in_array);
 
     switch (c)
     {
@@ -626,9 +611,9 @@ static const JsonValue *json__parse(JsonParser *p, JsonError *err)
         case '.':
             return json__error(p, err, JSON_ERR_LEADING_POINT);
         case '"':
-            return json__parse_string(p, err);
+            return json__parse_string(p, err, in_array);
         case '[':
-            return json__parse_array(p, err);
+            return json__parse_array(p, err, in_array);
         default:
             return json__error(p, err, JSON_ERR_ILLEGAL_CHARACTER);
     }
@@ -643,14 +628,13 @@ JsonDoc *json_parse(const char *src, size_t len, JsonError *err)
     JsonDoc *doc = json__doc_create();
 
     JsonParser parser = {
-        .src          = src,
-        .len          = len,
-        .pos          = 0,
-        .doc          = doc,
-        .alloc_target = JSON_ALLOC_ARENA,
+        .src = src,
+        .len = len,
+        .pos = 0,
+        .doc = doc,
     };
 
-    doc->root = json__parse(&parser, err);
+    doc->root = json__parse(&parser, err, false);
     if (!doc->root)
         goto error;
 
@@ -683,18 +667,15 @@ bool json_as_int64(const JsonValue *v, int64_t *out)
     if (!v || v->kind != JSON_NUMBER)
         return false;
 
-    if (out)
+    if (!v->as.num.is_int)
     {
-        if (!v->as.num.is_int)
-        {
-            if (v->as.num.d > (long double)INT64_MAX)
-                return false;
-            *out = (int64_t)v->as.num.d;
-        }
-        else
-        {
-            *out = v->as.num.i;
-        }
+        if (v->as.num.d > (long double)INT64_MAX)
+            return false;
+        if (out) *out = (int64_t)v->as.num.d;
+    }
+    else
+    {
+        if (out) *out = v->as.num.i;
     }
     return true;
 }
