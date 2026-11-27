@@ -320,7 +320,7 @@ typedef struct
 {
     CutLogLevel level;
     int line;
-    String *message;
+    String message;
     StringView file;
 } CutLog;
 
@@ -1156,7 +1156,7 @@ static void remove_path(StringView path)
 
 static void log_free(CutLog *log)
 {
-    da_free(log->message);
+    str_free(&log->message);
 }
 
 // Reset a log list.
@@ -1172,10 +1172,8 @@ static void log_list_append(CutLogList *logs, CutLog log, const char *fmt, va_li
 {
     assert(logs);
 
-    log.message = malloc(sizeof(String));
-    str_init(log.message);
-    assert(log.message);
-    str_appendvf(log.message, fmt, args);
+    str_init(&log.message);
+    str_appendvf(&log.message, fmt, args);
 
     da_append(logs, log);
 }
@@ -1235,7 +1233,7 @@ static void log_list_print(CutLogList *logs, FILE *fdout, const char *prefix)
                 fprintf(fdout, "[FATAL] "); 
                 break;
         }
-        fprintf(fdout, SV_FMT"\n", SV_ARG(*log.message));
+        fprintf(fdout, SV_FMT"\n", SV_ARG(log.message));
         if (is_ansi) fprintf(fdout, AFMT_RESET);
     }
 }
