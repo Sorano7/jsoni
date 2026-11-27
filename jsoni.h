@@ -17,6 +17,13 @@
 #include <stdint.h>
 #include <stdio.h>
 
+typedef struct
+{
+    void *ctx;
+    void *(*alloc)(void *ctx, size_t n);
+    void (*free)(void *ctx, void *p);
+} JsonAllocator;
+
 /* Kinds of a JSON value. */
 typedef enum
 {
@@ -95,7 +102,8 @@ typedef struct JsonError
  * Parse a JSON string from `src` to `src+len`, or null-terminator if `len` is 0.
  * Returns an allocated JsonDoc on success, or NULL and fills `err` on error .
  */
-JsonDoc *json_parse(const char *src, size_t len, JsonError *err);
+JsonDoc *json_parse(const char *src, size_t len, JsonError *err,
+        const JsonAllocator *a);
 
 /* Free the JSON document and all of its data. */
 void json_free(JsonDoc *doc);
@@ -154,6 +162,7 @@ struct JsonDoc
 {
     JsonChunk *head; /* JsonDoc is allocated within head */
     const JsonValue *root;
+    JsonAllocator a;
 };
 
 /* Allocate n in the JSON document's arena. */
@@ -196,18 +205,24 @@ static void *json__arena_alloc(JsonDoc *doc, size_t n)
 
 void json_free(JsonDoc *doc)
 {
+    if (!doc) return;
+
+    JsonAllocator a = doc->a;
     for (JsonChunk *c = doc->head; c;)
     {
         JsonChunk *next = c->next;
-        free(c);
+        a.free(a.ctx, c);
         c = next;
     }
 }
 
+void *json_default_alloc(void *ctx, size_t n) { (void)ctx; return malloc(n); }
+void json_default_free(void *ctx, void *p)    { (void)ctx; return free(p); }
+
 /* Allocate a JSON document. */
-static JsonDoc *json__doc_create(void)
+static JsonDoc *json__doc_create(JsonAllocator a)
 {
-    JsonChunk *c = calloc(1, sizeof(*c) + JSONI_CHUNK_SIZE);
+    JsonChunk *c = a.alloc(a.ctx, sizeof(*c) + JSONI_CHUNK_SIZE);
     assert(c);
     c->next = NULL;
     c->cap = JSONI_CHUNK_SIZE;
@@ -215,6 +230,7 @@ static JsonDoc *json__doc_create(void)
     JsonDoc *doc = (JsonDoc *)(c + 1);
     doc->head = c;
     doc->root = NULL;
+    doc->a = a;
 
     c->used = sizeof(*doc);
     return doc;
@@ -228,18 +244,24 @@ typedef struct
 } JsonValueStack;
 
 /* Free a dynamic array */
-#define json__da_free(da) do {        \
-    if ((da)->data) free((da)->data); \
+#define json__da_free(ac, da) do {        \
+    if ((da)->data) (ac).free((ac).ctx, (da)->data); \
 } while (0)
 
 /* Grow or initialize a dynamic array by one */
-#define json__da_grow(da) do {                                             \
-    if ((da)->len >= (da)->cap) {                                          \
-        (da)->cap = (da)->cap == 0 ? 64 : (da)->cap * 2;                   \
-        (da)->data = realloc((da)->data, (da)->cap * sizeof(*(da)->data)); \
-        if (!(da)->data) abort();                                          \
-    }                                                                      \
-    (da)->len++;                                                           \
+#define json__da_grow(ac, da) do {                            \
+    if ((da)->len >= (da)->cap) {                             \
+        (da)->cap = (da)->cap == 0 ? 64 : (da)->cap * 2;      \
+        size_t sz = (da)->cap * sizeof(*(da)->data);          \
+        void *data = (ac).alloc((ac).ctx, sz);                \
+        if ((da)->data) {                                     \
+            memcpy(data, (da)->data, sz);                     \
+            (ac).free((ac).ctx, (da)->data);                  \
+        }                                                     \
+        (da)->data = data;                                    \
+        if (!(da)->data) abort();                             \
+    }                                                         \
+    (da)->len++;                                              \
 } while (0)
 
 /* Get the last slot of the dynamic array */
@@ -261,7 +283,7 @@ static inline JsonValue *json__value_alloc(JsonParser *p, JsonKind kind, bool in
     JsonValue *v;
     if (in_array)
     {
-        json__da_grow(&p->value_stack);
+        json__da_grow(p->doc->a, &p->value_stack);
         v = json__da_last(&p->value_stack);
     }
     else
@@ -620,12 +642,20 @@ static const JsonValue *json__parse(JsonParser *p, JsonError *err, bool in_array
 
 }
 
-JsonDoc *json_parse(const char *src, size_t len, JsonError *err)
+JsonDoc *json_parse(const char *src, size_t len, JsonError *err,
+        const JsonAllocator *a)
 {
     assert(src);
     if (len == 0) len = strlen(src);
 
-    JsonDoc *doc = json__doc_create();
+    JsonAllocator ac = {
+        .alloc = json_default_alloc,
+        .free  = json_default_free,
+        .ctx   = NULL,
+    };
+    if (a) ac = *a;
+
+    JsonDoc *doc = json__doc_create(ac);
 
     JsonParser parser = {
         .src = src,
@@ -651,7 +681,7 @@ error:
     doc = NULL;
 
 cleanup:
-    json__da_free(&parser.value_stack);
+    json__da_free(ac, &parser.value_stack);
 
     return doc;
 }

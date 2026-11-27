@@ -11,7 +11,7 @@
 
 #define PARSE(src) do {                                    \
     if (doc) json_free(doc);                               \
-    doc = json_parse((src), sizeof(src)-1, &err);          \
+    doc = json_parse((src), sizeof(src)-1, &err, NULL);    \
     if (doc == NULL)                                       \
         CUT_FATAL("Failed to parse "#src": %s (%d:%d)",    \
                 err.msg, err.line, err.column);            \
@@ -21,7 +21,7 @@
 #define PARSE_FAIL(src, c) do {                            \
     (void)root;                                            \
     if (doc) json_free(doc);                               \
-    doc = json_parse((src), sizeof(src)-1, &err);          \
+    doc = json_parse((src), sizeof(src)-1, &err, NULL);    \
     if (doc != NULL)                                       \
         CUT_FATAL("Did not fail to parse "#src);           \
     if (err.code != c)                                     \
@@ -226,6 +226,54 @@ TEST(test_parse_nested_array)
         INT_EQ(v3_1_1, 4);
 
     PARSE_END();
+}
+
+typedef struct
+{
+    size_t allocd, freed;
+} TestAllocCtx;
+
+typedef struct
+{
+    size_t size;
+} TestAllocHeader;
+
+static void *test_alloc(void *ctx, size_t n)
+{
+    TestAllocCtx *c = ctx;
+    c->allocd += n;
+
+    TestAllocHeader *h = malloc(sizeof(*h) + n);
+    memset(h, 0xcd, sizeof(*h)+n);
+    h->size = n;
+    return h + 1;
+}
+
+static void test_free(void *ctx, void *p)
+{
+    TestAllocHeader *h = ((TestAllocHeader *)p) - 1;
+    TestAllocCtx *c = ctx;
+    c->freed += h->size;
+    free(h);
+}
+
+TEST(test_custom_allocator)
+{
+    TestAllocCtx ctx = {0};
+    JsonAllocator a = {
+        .alloc = test_alloc,
+        .free = test_free,
+        .ctx = &ctx,
+    };
+
+    PARSE_START();
+        StringView src = SV("[1, \"hello\", true]");
+        doc = json_parse(src.data, src.len, &err, &a);
+        CUT_MUST(doc && (root = json_root(doc)));
+        INT_EQ(json_array_get(root, 0), 1);
+    PARSE_END();
+
+    CUT_CHECK(ctx.allocd > 0 && ctx.allocd == ctx.freed);
 }
 
 TEST_RUN()
