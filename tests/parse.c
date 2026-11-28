@@ -11,8 +11,8 @@
 
 #define PARSE(src) do {                                    \
     if (doc) json_free(doc);                               \
-    doc = json_parse((src), sizeof(src)-1, &err, NULL);    \
-    if (doc == NULL)                                       \
+    doc = json_parse_n((src), sizeof(src)-1, &err, NULL);    \
+    if (!doc)                                       \
         CUT_FATAL("Failed to parse "#src": %s (%d:%d)",    \
                 err.msg, err.line, err.column);            \
     root = json_root(doc);                                 \
@@ -21,8 +21,8 @@
 #define PARSE_FAIL(src, c) do {                            \
     (void)root;                                            \
     if (doc) json_free(doc);                               \
-    doc = json_parse((src), sizeof(src)-1, &err, NULL);    \
-    if (doc != NULL)                                       \
+    doc = json_parse_n((src), sizeof(src)-1, &err, NULL);    \
+    if (doc)                                       \
         CUT_FATAL("Did not fail to parse "#src);           \
     if (err.code != c)                                     \
         CUT_ERROR("expected %s, got %s",                   \
@@ -51,10 +51,10 @@
     CUT_CHECK(val == (want));           \
 } while (0)
 
-#define STR_EQ(jv, want) do {                         \
-    StringView val;                                   \
-    CUT_MUST(val.data = json_as_str((jv), &val.len)); \
-    CUT_CHECK(sv_equal(val, (want)));                 \
+#define STR_EQ(jv, want) do {                             \
+    StringView val__;                                     \
+    CUT_MUST(val__.data = json_as_str((jv), &val__.len)); \
+    CUT_CHECK(sv_equal(val__, (want)));                   \
 } while (0)
 
 #define ARR_LEN_EQ(jv, want) do {           \
@@ -92,7 +92,7 @@ TEST(test_json_parse_special_literals)
 {
     PARSE_START();
         PARSE("null");
-        CUT_MUST(root->kind == JSON_NULL);
+        CUT_MUST(json_as_null(root));
 
         PARSE("true");
         BOOL_EQ(root, true);
@@ -228,6 +228,66 @@ TEST(test_parse_nested_array)
     PARSE_END();
 }
 
+TEST(test_parse_object)
+{
+    PARSE_START();
+        PARSE("{\"value\": 1, \"\": true}");
+        const JsonValue *v1 = json_object_get(root, "value");
+        INT_EQ(v1, 1);
+
+        const JsonValue *v2 = json_object_get(root, "");
+        BOOL_EQ(v2, true);
+
+        CUT_CHECK(!json_object_get(root, "key"));
+
+        PARSE("{}");
+
+        PARSE_FAIL("{1}", JSON_ERR_OBJ_MISSING_KEY);
+        PARSE_FAIL("{\"\"}", JSON_ERR_OBJ_MISSING_COLON);
+        PARSE_FAIL("{\"\": }", JSON_ERR_OBJ_MISSING_VALUE);
+    PARSE_END();
+}
+
+TEST(test_parse_nested_object)
+{
+    PARSE_START();
+        PARSE("{\"inner\": {\"value\": 100}}");
+        const JsonValue *v = json_object_get(json_object_get(root, "inner"), "value");
+        INT_EQ(v, 100);
+    PARSE_END();
+}
+
+TEST(test_parse_nested_array_and_object)
+{
+    PARSE_START();
+        PARSE(
+            "{                              "
+            "   \"arr\": [                  "
+            "       {                       "
+            "           \"foo\": true,      "
+            "           \"bar\": \"hello\"  "
+            "       },                      "
+            "       {                       "
+            "           \"baz\": [1, null]  "
+            "       }                       "
+            "   ]                           "
+            "}                              "
+        );
+        const JsonValue *arr = json_object_get(root, "arr");
+        ARR_LEN_EQ(arr, 2);
+
+        const JsonValue *obj1 = json_array_get(arr, 0);
+        BOOL_EQ(json_object_get(obj1, "foo"), true);
+        STR_EQ(json_object_get(obj1, "bar"), "hello");
+
+        const JsonValue *obj2 = json_array_get(arr, 1);
+        const JsonValue *baz = json_object_get(obj2, "baz");
+        ARR_LEN_EQ(baz, 2);
+        INT_EQ(json_array_get(baz, 0), 1);
+        CUT_CHECK(json_as_null(json_array_get(baz, 1)));
+    PARSE_END();
+}
+
 typedef struct
 {
     size_t allocd, freed;
@@ -268,7 +328,7 @@ TEST(test_custom_allocator)
 
     PARSE_START();
         StringView src = SV("[1, \"hello\", true]");
-        doc = json_parse(src.data, src.len, &err, &a);
+        doc = json_parse_n(src.data, src.len, &err, &a);
         CUT_MUST(doc && (root = json_root(doc)));
         INT_EQ(json_array_get(root, 0), 1);
     PARSE_END();

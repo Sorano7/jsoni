@@ -38,18 +38,6 @@ typedef enum
 /* Tagged union for JSON values. */
 typedef struct JsonValue JsonValue;
 
-struct JsonValue
-{
-    JsonKind kind;
-    union
-    {
-        bool                                          boolean;
-        struct { bool is_int; double d; int64_t i; }  num;
-        struct { const char *data; size_t len; }      str;
-        struct { const JsonValue *data; size_t len; } arr;
-    } as;
-};
-
 #ifndef JSONI_CHUNK_SIZE
     #define JSONI_CHUNK_SIZE 2048
 #endif
@@ -77,6 +65,11 @@ typedef struct JsonDoc JsonDoc;
                                                                                  \
     XX(JSON_ERR_UNTERMINATED_ARRAY,     "Unterminated array")                    \
     XX(JSON_ERR_TRAILING_COMMA,         "Trailing comma")                        \
+                                                                                 \
+    XX(JSON_ERR_UNTERMINATED_OBJECT,    "Unterminated object")                   \
+    XX(JSON_ERR_OBJ_MISSING_KEY,        "Missing object key")                    \
+    XX(JSON_ERR_OBJ_MISSING_COLON,      "Missing colon after object key")        \
+    XX(JSON_ERR_OBJ_MISSING_VALUE,      "Missing value after colon")             \
 
 #define json__enum_member(M, ...) M,
 #define json__enum_as_str(M, S) [M] = S,
@@ -99,11 +92,11 @@ typedef struct JsonError
 } JsonError;
 
 /*
- * Parse a JSON string from `src` to `src+len`, or null-terminator if `len` is 0.
+ * Parse a JSON source string.
  * Returns an allocated JsonDoc on success, or NULL and fills `err` on error .
  */
-JsonDoc *json_parse(const char *src, size_t len, JsonError *err,
-        const JsonAllocator *a);
+JsonDoc *json_parse(const char *src, JsonError *err, const JsonAllocator *a);
+JsonDoc *json_parse_n(const char *src, size_t len, JsonError *err, const JsonAllocator *a);
 
 /* Free the JSON document and all of its data. */
 void json_free(JsonDoc *doc);
@@ -120,6 +113,9 @@ bool json_as_double(const JsonValue *v, double *out);
 /* Convert the JSON value into boolean. Returns false on failure. */
 bool json_as_bool(const JsonValue *v, bool *out);
 
+/* Return whether v is a null value */
+bool json_as_null(const JsonValue *v);
+
 /*
  * Convert the JSON value into string and set n_out to length.
  * Returns NULL on failure.
@@ -131,6 +127,13 @@ const JsonValue *json_array_get(const JsonValue *v, size_t i);
 
 /* Get the array length from the JSON value. Returns false on failure. */
 bool json_array_length(const JsonValue *v, size_t *out);
+
+/*
+ * Get the JSON value from v["key"]. If key_len is 0 
+ * Returns null on failure.
+ */
+const JsonValue *json_object_get(const JsonValue *v, const char *key);
+const JsonValue *json_object_get_n(const JsonValue *v, const char *key, size_t len);
 
 #endif // JSONI_H_
 
@@ -163,6 +166,22 @@ struct JsonDoc
     JsonChunk *head; /* JsonDoc is allocated within head */
     const JsonValue *root;
     JsonAllocator a;
+};
+
+/* A key-value pair member of a object */
+typedef struct JsonMember JsonMember;
+
+struct JsonValue
+{
+    JsonKind kind;
+    union
+    {
+        bool                                           boolean;
+        struct { bool is_int; double d; int64_t i; }   num;
+        struct { const char *data; size_t len; }       str;
+        struct { const JsonValue *data; size_t len; }  arr;
+        struct { const JsonMember *data; size_t len; } obj;
+    } as;
 };
 
 /* Allocate n in the JSON document's arena. */
@@ -243,6 +262,19 @@ typedef struct
     size_t len, cap;
 } JsonValueStack;
 
+struct JsonMember
+{
+    const char *key;
+    size_t key_len;
+    const JsonValue *val;
+};
+
+typedef struct
+{
+    JsonMember *data;
+    size_t len, cap;
+} JsonMemberStack;
+
 /* Free a dynamic array */
 #define json__da_free(ac, da) do {        \
     if ((da)->data) (ac).free((ac).ctx, (da)->data); \
@@ -275,7 +307,14 @@ typedef struct
     JsonDoc *doc;
 
     JsonValueStack value_stack;
+    JsonMemberStack member_stack;
 } JsonParser;
+
+static void json__parser_free(JsonParser *p, JsonAllocator a)
+{
+    json__da_free(a, &p->value_stack);
+    json__da_free(a, &p->member_stack);
+}
 
 /* Allocate a JSON value and set the kind */
 static inline JsonValue *json__value_alloc(JsonParser *p, JsonKind kind, bool in_array)
@@ -309,9 +348,34 @@ static inline JsonValue *json__value_alloc(JsonParser *p, JsonKind kind, bool in
 #define json__is_digit(p) (!json__is_eof(p) && isdigit(json__chr(p)))
 
 /* Advance parser until the next non-whitespace character or EOF. */
-#define json__skip_ws(p) do {                                       \
-    while (!json__is_eof(p) && isspace(json__chr(p)))               \
-        (p)->pos++;                                                 \
+static inline void json__skip_ws(JsonParser *p)
+{
+    while (!json__is_eof(p) && isspace(json__chr(p)))
+        (p)->pos++;
+}
+
+static inline bool json__try_consume(JsonParser *p, char c)
+{
+    json__skip_ws(p);
+    if (json__chr(p) == c)
+    {
+        p->pos++;
+        return true;
+    }
+    return false;
+}
+
+#define JSON__SHOULD_CONSUME(p, chr, err, code) do {      \
+    json__skip_ws(p);                                     \
+    if (json__chr(p) != (chr))                            \
+        return (void *)json__error((p), (err), (code));   \
+    (p)->pos++;                                           \
+} while (0)
+
+#define JSON__MUST_CONSUME(p, chr) do {                   \
+    json__skip_ws(p);                                     \
+    assert(json__chr(p) == (chr));                        \
+    (p)->pos++;                                           \
 } while (0)
 
 /* Returns whether `c` is considered a token boundary. */
@@ -384,18 +448,17 @@ static bool json__find_closing_quotes(JsonParser *p, size_t *out, JsonError *err
         if (c == '"') break;
         if (c == '\\') p->pos++;
     }
-    if (json__is_eof(p) || json__chr(p) != '"')
-        return json__error(p, err, JSON_ERR_UNTERMINATED_STRING);
+    JSON__SHOULD_CONSUME(p, '"', err, JSON_ERR_UNTERMINATED_STRING);
 
     *out = p->pos - start;
     p->pos = start;
     return true;
 }
 
-/* Parse a JSON string value. */
-static const JsonValue *json__parse_string(JsonParser *p, JsonError *err, bool in_array)
+static const char *json__scan_string(JsonParser *p, JsonError *err, size_t *out_len)
 {
-    p->pos++;
+    JSON__MUST_CONSUME(p, '"');
+
     const unsigned char *s = (unsigned char *)json__str(p);
 
     size_t ilen = 0;
@@ -451,9 +514,16 @@ static const JsonValue *json__parse_string(JsonParser *p, JsonError *err, bool i
     }
     p->pos += ++i;
 
+    *out_len = olen;
+    return out;
+}
+
+/* Parse a JSON string value. */
+static const JsonValue *json__parse_string(JsonParser *p, JsonError *err, bool in_array)
+{
     JsonValue *v = json__value_alloc(p, JSON_STRING, in_array);
-    v->as.str.data = out;
-    v->as.str.len = olen;
+    v->as.str.data = json__scan_string(p, err, &v->as.str.len);
+    if (!v->as.str.data) return NULL;
     return v;
 }
 
@@ -554,45 +624,28 @@ static const JsonValue *json__parse_literal(JsonParser *p, JsonError *err, bool 
 /* Parse an array of JSON values */
 static const JsonValue *json__parse_array(JsonParser *p, JsonError *err, bool in_array)
 {
-    p->pos++;
-    json__skip_ws(p);
-
     JsonValue *v = json__value_alloc(p, JSON_ARRAY, in_array);
     v->as.arr.len = 0;
     v->as.arr.data = NULL;
 
-    if (json__chr(p) == ']')
-    {
-        p->pos++;
-        return v;
-    }
+    JSON__MUST_CONSUME(p, '[');
 
     size_t stack_start = p->value_stack.len;
 
-    while (!json__is_eof(p))
+    json__skip_ws(p);
+    while (!json__is_eof(p) && json__chr(p) != ']')
     {
         if (!json__parse(p, err, true))
             return NULL;
 
         v->as.arr.len++;
 
-        json__skip_ws(p);
-
-        if (json__chr(p) == ']')
-            break;
-
-        if (json__chr(p) == ',')
-        {
-            p->pos++;
-            json__skip_ws(p);
-            if (json__chr(p) == ']')
-                return json__error(p, err, JSON_ERR_TRAILING_COMMA);
-        }
+        if (json__try_consume(p, ',') && json__try_consume(p, ']'))
+            return json__error(p, err, JSON_ERR_TRAILING_COMMA);
     }
 
-    if (json__chr(p) != ']')
+    if (!json__try_consume(p, ']'))
         return json__error(p, err, JSON_ERR_UNTERMINATED_ARRAY);
-    p->pos++;
 
     if (v->as.arr.len > 0)
     {
@@ -602,6 +655,61 @@ static const JsonValue *json__parse_array(JsonParser *p, JsonError *err, bool in
         v->as.arr.data = data;
 
         p->value_stack.len = stack_start;
+    }
+
+    return v;
+}
+
+/* Parse a JSON object */
+static const JsonValue *json__parse_object(JsonParser *p, JsonError *err, bool in_array)
+{
+    JsonValue *v = json__value_alloc(p, JSON_OBJECT, in_array);
+    v->as.obj.len = 0;
+    v->as.obj.data = NULL;
+
+    JSON__MUST_CONSUME(p, '{');
+
+    size_t stack_start = p->member_stack.len;
+
+    json__skip_ws(p);
+    while (!json__is_eof(p) && json__chr(p) != '}')
+    {
+        json__da_grow(p->doc->a, &p->member_stack);
+        JsonMember *next = json__da_last(&p->member_stack);
+
+        json__skip_ws(p);
+        if (json__chr(p) != '"')
+            return json__error(p, err, JSON_ERR_OBJ_MISSING_KEY);
+
+        next->key = json__scan_string(p, err, &next->key_len);
+        if (!next->key) return NULL;
+
+        JSON__SHOULD_CONSUME(p, ':', err, JSON_ERR_OBJ_MISSING_COLON);
+
+        json__skip_ws(p);
+        if (json__is_eof(p) || json__chr(p) == '}')
+            return json__error(p, err, JSON_ERR_OBJ_MISSING_VALUE);
+
+        next->val = json__parse(p, err, false);
+        if (!next->val) return NULL;
+
+        v->as.obj.len++;
+
+        if (json__try_consume(p, ',') && json__try_consume(p, '}'))
+            return json__error(p, err, JSON_ERR_TRAILING_COMMA);
+    }
+
+    if (!json__try_consume(p, '}'))
+        return json__error(p, err, JSON_ERR_UNTERMINATED_OBJECT);
+
+    if (v->as.obj.len > 0)
+    {
+        size_t obj_size = v->as.obj.len * sizeof(JsonMember);
+        JsonMember *data = json__arena_alloc(p->doc, obj_size);
+        memcpy(data, p->member_stack.data + stack_start, obj_size);
+        v->as.obj.data = data;
+
+        p->member_stack.len = stack_start;
     }
 
     return v;
@@ -636,17 +744,23 @@ static const JsonValue *json__parse(JsonParser *p, JsonError *err, bool in_array
             return json__parse_string(p, err, in_array);
         case '[':
             return json__parse_array(p, err, in_array);
+        case '{':
+            return json__parse_object(p, err, in_array);
         default:
             return json__error(p, err, JSON_ERR_ILLEGAL_CHARACTER);
     }
 
 }
 
-JsonDoc *json_parse(const char *src, size_t len, JsonError *err,
+JsonDoc *json_parse(const char *src, JsonError *err, const JsonAllocator *a)
+{
+    return json_parse_n(src, strlen(src), err, a);
+}
+
+JsonDoc *json_parse_n(const char *src, size_t len, JsonError *err,
         const JsonAllocator *a)
 {
     assert(src);
-    if (len == 0) len = strlen(src);
 
     JsonAllocator ac = {
         .alloc = json_default_alloc,
@@ -668,6 +782,7 @@ JsonDoc *json_parse(const char *src, size_t len, JsonError *err,
     if (!doc->root)
         goto error;
 
+    json__skip_ws(&parser);
     if (!json__is_eof(&parser))
     {
         json__error(&parser, err, JSON_ERR_TRAILING_CHAR);
@@ -681,7 +796,7 @@ error:
     doc = NULL;
 
 cleanup:
-    json__da_free(ac, &parser.value_stack);
+    json__parser_free(&parser, ac);
 
     return doc;
 }
@@ -735,6 +850,11 @@ bool json_as_bool(const JsonValue *v, bool *out)
     return true;
 }
 
+bool json_as_null(const JsonValue *v)
+{
+    return v && v->kind == JSON_NULL;
+}
+
 const char *json_as_str(const JsonValue *v, size_t *n_out)
 {
     if (!v || v->kind != JSON_STRING)
@@ -764,6 +884,28 @@ bool json_array_length(const JsonValue *v, size_t *out)
     if (out)
         *out = v->as.arr.len;
     return true;
+}
+
+const JsonValue *json_object_get(const JsonValue *v, const char *key)
+{
+    return json_object_get_n(v, key, strlen(key));
+}
+
+const JsonValue *json_object_get_n(const JsonValue *v, const char *key, size_t len)
+{
+    if (!v || v->kind != JSON_OBJECT || !key)
+        return NULL;
+
+    for (size_t i = 0; i < v->as.obj.len; i++)
+    {
+        JsonMember m = v->as.obj.data[i];
+        if (len != m.key_len) continue;
+
+        size_t minlen = len < m.key_len ? len : m.key_len;
+        if (strncmp(m.key, key, minlen) == 0)
+            return m.val;
+    }
+    return NULL;
 }
 
 #endif // JSONI_IMPL
